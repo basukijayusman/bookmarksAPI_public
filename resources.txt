@@ -1,0 +1,5 @@
+Resources:
+  - https://github.com/topics/bookmarks-api
+  - yenilikci/flask-bookmark-api (https://github.com/yenilikci/flask-bookmark-api)
+  - alperencubuk/FastAPI-JWT-Auth (https://github.com/alperencubuk/FastAPI-JWT-Auth)
+  - sabuhibrahim/fastapi-jwt-auth-full-example (https://github.com/sabuhibrahim/fastapi-jwt-auth-full-example)

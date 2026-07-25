@@ -1,0 +1,19 @@
+# Virtualenv
+.venv/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Local database (SQLite) — never commit real data
+*.db
+
+# Secrets — the real SECRET_KEY lives here; commit .env.example instead
+.env
+
+# Test / lint caches
+.pytest_cache/
+.ruff_cache/
+
+# Editor & tooling state
+.vscode/
