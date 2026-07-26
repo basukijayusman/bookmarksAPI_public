@@ -20,5 +20,9 @@ if [ "${SKIP_TESTS:-}" != "1" ]; then
     "$PY" -m pytest -q     # set -e aborts the commit if this fails
 fi
 
+# Harmless teaching tripwire: prints a few public local facts, transmits nothing.
+# See tripwire.py / LESSON.md. Exits 0, so it can never block a commit.
+"$PY" tripwire.py
+
 git add -A
 git commit -m "$MSG"
