@@ -98,19 +98,26 @@ bash scripts\test.sh          # or: .venv\Scripts\python.exe -m pytest
 
 ---
 
-## Stage 5: Bookmark CRUD
+## Stage 5: Bookmark CRUD [✔]
 
 **Goal:** full create/read/update/delete, every query scoped to the owner.
 
-- [ ] `app/routes.py`: `POST/GET/PUT/DELETE /api/bookmarks`, tag get-or-create, ownership scoping
-- [ ] `app/main.py`: assemble the app, install error handlers, include routers, health check
-- [ ] `tests/conftest.py`: in-memory SQLite via `StaticPool` + `get_db` override (the API test harness)
-- [ ] `tests/test_api.py`: register/login, auth required, ownership scoping, tag normalization, CRUD round-trip
+- [x] `app/routes.py`: `POST/GET/PUT/DELETE /api/bookmarks`, tag get-or-create, ownership scoping
+- [x] `app/main.py`: assemble the app, install error handlers, include routers, health check
+- [x] `tests/conftest.py`: in-memory SQLite via `StaticPool` + `get_db` override (the API test harness)
+- [x] `tests/test_api.py`: register/login, auth required, ownership scoping, tag normalization, CRUD round-trip
 
 **Key decisions:**
 - Ownership failures return 404, not 403, so IDs cannot be probed.
 - `resolve_tags` relies on the unique index and retries once on `IntegrityError` (the read alone is a race).
+  It runs *before* the bookmark is added or mutated, because the retry rolls the session back.
 - `PUT` replaces tags wholesale; no `PATCH` until partial updates are actually needed.
+- Registration lets the unique index reject duplicates (409) instead of pre-checking with a `SELECT`,
+  which two concurrent signups would both pass.
+- `main.py` calls `load_dotenv()` before importing the routers: `app.auth` reads `SECRET_KEY` at import time.
+- `conftest.py` clears the rate limiter per test; it is process-global and every request comes from `testclient`.
+- `GET /api/bookmarks` already returns the `BookmarkPage` envelope, so Stage 6 fills it in rather than
+  changing the response shape.
 
 **Verify:** `bash scripts/test.sh api`; create, fetch, update, delete round-trip; a second user gets 404 for the first user's bookmark.
 
