@@ -4,8 +4,10 @@ Every bookmark query filters on the caller's user_id in the WHERE clause. Owners
 is never checked by loading a row and comparing afterwards.
 """
 
-from fastapi import APIRouter, Depends
-from sqlalchemy import select
+from datetime import date, datetime, time, timedelta
+
+from fastapi import APIRouter, Depends, Query
+from sqlalchemy import func, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -21,12 +23,16 @@ from .db import get_db
 from .errors import ApiError
 from .models import Bookmark, Tag, User
 from .schemas import (
+    MAX_TAG_LEN,
     AuthOut,
     BookmarkIn,
     BookmarkOut,
     BookmarkPage,
     LoginIn,
+    MonthCount,
     RegisterIn,
+    Stats,
+    TagCount,
     UserOut,
 )
 
@@ -137,19 +143,127 @@ def create_bookmark(
     return bookmark
 
 
+PER_PAGE_DEFAULT = 20
+PER_PAGE_MAX = 100
+TOP_TAGS = 10
+
+
+def _like(term: str) -> str:
+    """A contains-pattern with the wildcards in `term` neutered.
+
+    LIKE reads % and _ as wildcards, so an unescaped search for "100%" also matches
+    "1000". Not an injection risk (the term is bound), just the wrong answer.
+    """
+    escaped = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
 @bookmarks_router.get("", response_model=BookmarkPage)
 def list_bookmarks(
+    tag: str | None = Query(None, max_length=MAX_TAG_LEN, description="Exact tag name."),
+    q: str | None = Query(None, max_length=200, description="Substring of title or description."),
+    date_from: date | None = Query(None, alias="from", description="Created on or after (UTC)."),
+    date_to: date | None = Query(None, alias="to", description="Created on or before (UTC)."),
+    page: int = Query(1, ge=1),
+    per_page: int = Query(PER_PAGE_DEFAULT, ge=1, le=PER_PAGE_MAX),
     db: Session = Depends(get_db),
     user: User = Depends(current_user),
 ) -> BookmarkPage:
+    where = [Bookmark.user_id == user.id]
+    if tag:
+        # Normalised the same way BookmarkIn normalises on write, or "Python" would
+        # never match the "python" row it created.
+        where.append(Bookmark.tags.any(Tag.name == tag.strip().lower()))
+    if q:
+        # ilike, not like: SQLite's LIKE ignores ASCII case but Postgres' does not.
+        # A NULL description simply fails its half of the OR.
+        where.append(
+            or_(
+                Bookmark.title.ilike(_like(q), escape="\\"),
+                Bookmark.description.ilike(_like(q), escape="\\"),
+            )
+        )
+    if date_from:
+        where.append(Bookmark.created_at >= datetime.combine(date_from, time.min))
+    if date_to:
+        # Strictly before the next midnight, so the whole of `to` is included:
+        # created_at carries a time, so `<= to` would drop all but 00:00:00.
+        where.append(
+            Bookmark.created_at < datetime.combine(date_to + timedelta(days=1), time.min)
+        )
+
+    # A separate COUNT, because `total` means the size of the whole result set and
+    # len(items) can only ever be the size of one page.
+    total = db.scalar(select(func.count()).select_from(Bookmark).where(*where))
     items = db.scalars(
         select(Bookmark)
-        .where(Bookmark.user_id == user.id)
+        .where(*where)
         .order_by(Bookmark.created_at.desc(), Bookmark.id.desc())
+        .limit(per_page)
+        .offset((page - 1) * per_page)
     ).all()
-    # ponytail: one page of everything until Stage 6 adds the query params. The
-    # envelope is already the final shape, so that stage only fills it in.
-    return BookmarkPage(items=items, total=len(items), page=1, per_page=len(items))
+    return BookmarkPage(items=items, total=total or 0, page=page, per_page=per_page)
+
+
+# --- stats ------------------------------------------------------------------
+#
+# Raw SQL on purpose: these are aggregates across the association table, and the ORM
+# would only add a translation layer over SQL that is already the clearest statement
+# of the question. :uid is a bound parameter, never interpolated.
+#
+# strftime() is SQLite's; Postgres wants to_char(created_at, 'YYYY-MM'). The literal
+# '%Y-%m' is safe inside text() here because sqlite3 uses qmark paramstyle and does
+# no %-interpolation of its own.
+
+_TOTALS_SQL = text("""
+    SELECT (SELECT COUNT(*) FROM bookmarks WHERE user_id = :uid) AS total_bookmarks,
+           -- DISTINCT tag_id over the caller's bookmarks, never COUNT(*) FROM tags:
+           -- tags are global, so that would count every user's tags.
+           (SELECT COUNT(DISTINCT bt.tag_id)
+              FROM bookmark_tags bt
+              JOIN bookmarks b ON b.id = bt.bookmark_id
+             WHERE b.user_id = :uid) AS total_tags
+""")
+
+_TOP_TAGS_SQL = text("""
+    SELECT t.name, COUNT(*) AS uses
+      FROM tags t
+      JOIN bookmark_tags bt ON bt.tag_id = t.id
+      JOIN bookmarks b ON b.id = bt.bookmark_id
+     WHERE b.user_id = :uid
+     GROUP BY t.id, t.name
+     ORDER BY uses DESC, t.name ASC
+     LIMIT :limit
+""")
+
+_PER_MONTH_SQL = text("""
+    SELECT strftime('%Y-%m', created_at) AS month, COUNT(*) AS created
+      FROM bookmarks
+     WHERE user_id = :uid
+     GROUP BY month
+     ORDER BY month ASC
+""")
+
+
+# Declared before /{bookmark_id}: routes match in definition order, so the other way
+# round "stats" would be parsed as a bookmark id and fail validation.
+@bookmarks_router.get("/stats", response_model=Stats)
+def bookmark_stats(
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> Stats:
+    params = {"uid": user.id}
+    total_bookmarks, total_tags = db.execute(_TOTALS_SQL, params).one()
+    # Unpacked positionally rather than by attribute: a Row is tuple-backed, so
+    # row.count would resolve to tuple.count, the method.
+    top = db.execute(_TOP_TAGS_SQL, {**params, "limit": TOP_TAGS}).all()
+    months = db.execute(_PER_MONTH_SQL, params).all()
+    return Stats(
+        total_bookmarks=total_bookmarks,
+        total_tags=total_tags,
+        top_tags=[TagCount(name=name, count=uses) for name, uses in top],
+        bookmarks_per_month=[MonthCount(month=month, count=n) for month, n in months],
+    )
 
 
 @bookmarks_router.get("/{bookmark_id}", response_model=BookmarkOut)

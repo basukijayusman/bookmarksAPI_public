@@ -1,8 +1,10 @@
-"""End-to-end API tests for Stage 5: auth routes and bookmark CRUD.
+"""End-to-end API tests: auth routes, bookmark CRUD, querying, stats, and the spec.
 
 These go through the real ASGI app against an in-memory database (see conftest.py),
 so routing, dependencies, the error handlers, and serialization are all covered.
 """
+
+from datetime import datetime, timedelta, timezone
 
 SAMPLE = {
     "url": "https://example.com/post",
@@ -20,6 +22,19 @@ def register(client, name: str = "alice") -> dict[str, str]:
     )
     assert response.status_code == 201, response.text
     return {"Authorization": f"Bearer {response.json()['token']}"}
+
+
+def create(client, headers, **overrides) -> dict:
+    """Store one bookmark, SAMPLE with the given fields replaced."""
+    response = client.post("/api/bookmarks", json={**SAMPLE, **overrides}, headers=headers)
+    assert response.status_code == 201, response.text
+    return response.json()
+
+
+def listed(client, headers, **params) -> dict:
+    response = client.get("/api/bookmarks", params=params, headers=headers)
+    assert response.status_code == 200, response.text
+    return response.json()
 
 
 def assert_error(response, status: int, code: str) -> dict:
@@ -204,3 +219,187 @@ def test_create_rejects_an_empty_title(client):
         "/api/bookmarks", json={**SAMPLE, "title": ""}, headers=register(client)
     )
     assert assert_error(response, 422, "VALIDATION_ERROR")["details"]["field"] == "title"
+
+
+# --- search and filter ------------------------------------------------------
+
+
+def test_filter_by_tag_returns_only_the_matching_bookmarks(client):
+    headers = register(client)
+    create(client, headers, title="Rust one", tags=["rust"])
+    create(client, headers, title="Python one", tags=["python"])
+
+    body = listed(client, headers, tag="rust")
+    assert [b["title"] for b in body["items"]] == ["Rust one"]
+    assert body["total"] == 1
+
+
+def test_filter_by_tag_normalises_the_query_the_way_the_write_path_does(client):
+    headers = register(client)
+    create(client, headers, tags=["Python"])
+    # Stored as "python", so an unnormalised query would match nothing it just created.
+    assert listed(client, headers, tag=" PYTHON ")["total"] == 1
+
+
+def test_search_matches_the_title_or_the_description_ignoring_case(client):
+    headers = register(client)
+    create(client, headers, title="Learning SQL", description="join notes")
+    create(client, headers, title="Unrelated", description="Deep sql internals")
+    create(client, headers, title="Neither", description=None)  # NULL fails its half of the OR
+
+    assert listed(client, headers, q="sql")["total"] == 2
+
+
+def test_search_treats_a_wildcard_as_a_literal_character(client):
+    headers = register(client)
+    create(client, headers, title="Battery at 100%")
+    create(client, headers, title="Battery at 1000 mAh")
+
+    # Unescaped, "100%" is the LIKE pattern "100 followed by anything" and matches both.
+    assert [b["title"] for b in listed(client, headers, q="100%")["items"]] == ["Battery at 100%"]
+
+
+def test_the_date_range_covers_the_whole_of_the_end_day(client):
+    headers = register(client)
+    create(client, headers)
+    # created_at is UTC, so the boundaries are UTC days regardless of the host's zone.
+    today = datetime.now(timezone.utc).date()
+
+    # to=today keeps a bookmark created at 14:32 today, not only one created at midnight.
+    assert listed(client, headers, **{"from": str(today), "to": str(today)})["total"] == 1
+    assert listed(client, headers, **{"from": str(today + timedelta(days=1))})["total"] == 0
+    assert listed(client, headers, **{"to": str(today - timedelta(days=1))})["total"] == 0
+
+
+def test_filters_stay_scoped_to_the_caller(client):
+    alice, bob = register(client, "alice"), register(client, "bob")
+    create(client, alice, title="Alice on rust", tags=["rust"])
+    create(client, bob, title="Bob on rust", tags=["rust"])
+
+    body = listed(client, bob, tag="rust", q="rust")
+    assert [b["title"] for b in body["items"]] == ["Bob on rust"]
+    assert body["total"] == 1
+
+
+# --- pagination -------------------------------------------------------------
+
+
+def test_pagination_reports_the_full_total_and_does_not_repeat_rows(client):
+    headers = register(client)
+    for n in range(5):
+        create(client, headers, title=f"Post {n}")
+
+    pages = [listed(client, headers, per_page=2, page=p) for p in (1, 2, 3)]
+    assert [len(page["items"]) for page in pages] == [2, 2, 1]
+    # total is the size of the whole result set, not of the page that was returned.
+    assert [page["total"] for page in pages] == [5, 5, 5]
+    assert pages[0]["page"] == 1 and pages[0]["per_page"] == 2
+
+    titles = [b["title"] for page in pages for b in page["items"]]
+    assert len(set(titles)) == 5  # the offsets do not overlap or skip
+
+
+def test_pagination_bounds_are_enforced(client):
+    headers = register(client)
+    over_cap = assert_error(
+        client.get("/api/bookmarks", params={"per_page": 1000}, headers=headers),
+        422,
+        "VALIDATION_ERROR",
+    )
+    assert over_cap["details"]["field"] == "per_page"
+    assert over_cap["details"]["limit"] == 100  # a client cannot ask for an unbounded page
+
+    under_floor = client.get("/api/bookmarks", params={"page": 0}, headers=headers)
+    assert assert_error(under_floor, 422, "VALIDATION_ERROR")["details"]["field"] == "page"
+
+
+# --- stats ------------------------------------------------------------------
+
+
+def test_stats_is_not_parsed_as_a_bookmark_id(client):
+    # /stats is declared before /{bookmark_id}; the other order makes this a 422.
+    response = client.get("/api/bookmarks/stats", headers=register(client))
+    assert response.status_code == 200, response.text
+
+
+def test_stats_requires_a_token(client):
+    assert_error(client.get("/api/bookmarks/stats"), 401, "UNAUTHENTICATED")
+
+
+def test_stats_counts_only_the_callers_bookmarks_and_tags(client):
+    alice, bob = register(client, "alice"), register(client, "bob")
+    create(client, alice, tags=["python", "web"])
+    create(client, alice, tags=["python"])
+    create(client, bob, tags=["python", "rust", "go"])
+
+    body = client.get("/api/bookmarks/stats", headers=alice).json()
+    assert body["total_bookmarks"] == 2
+    # 4 tag rows exist globally; 2 of them are on alice's bookmarks. Counting the
+    # tags table instead would report bob's rust and go as well.
+    assert body["total_tags"] == 2
+    assert body["top_tags"] == [{"name": "python", "count": 2}, {"name": "web", "count": 1}]
+    assert body["bookmarks_per_month"] == [
+        {"month": datetime.now(timezone.utc).strftime("%Y-%m"), "count": 2}
+    ]
+
+
+def test_stats_is_all_zeroes_for_a_user_with_no_bookmarks(client):
+    body = client.get("/api/bookmarks/stats", headers=register(client)).json()
+    assert body == {
+        "total_bookmarks": 0,
+        "total_tags": 0,
+        "top_tags": [],
+        "bookmarks_per_month": [],
+    }
+
+
+# --- OpenAPI documentation --------------------------------------------------
+
+
+def test_the_docs_and_the_spec_are_served(client):
+    assert client.get("/docs").status_code == 200
+    assert client.get("/openapi.json").status_code == 200
+
+
+def test_the_spec_requires_a_bearer_token_on_protected_endpoints_only(client):
+    spec = client.get("/openapi.json").json()
+    scheme = spec["components"]["securitySchemes"]["HTTPBearer"]
+    assert scheme["type"] == "http" and scheme["scheme"] == "bearer"
+
+    paths = spec["paths"]
+    assert paths["/api/bookmarks"]["get"]["security"]
+    assert paths["/api/bookmarks/stats"]["get"]["security"]
+    assert paths["/api/bookmarks/{bookmark_id}"]["delete"]["security"]
+    # The credential endpoints issue the token, so requiring one would be circular.
+    assert "security" not in paths["/api/auth/login"]["post"]
+    assert "security" not in paths["/health"]["get"]
+
+
+def test_the_spec_names_the_response_model_of_every_endpoint(client):
+    spec = client.get("/openapi.json").json()
+
+    def ref(path: str, method: str, status: str) -> str:
+        content = spec["paths"][path][method]["responses"][status]["content"]
+        return content["application/json"]["schema"]["$ref"]
+
+    assert ref("/api/auth/register", "post", "201").endswith("/AuthOut")
+    assert ref("/api/bookmarks", "post", "201").endswith("/BookmarkOut")
+    assert ref("/api/bookmarks", "get", "200").endswith("/BookmarkPage")
+    assert ref("/api/bookmarks/stats", "get", "200").endswith("/Stats")
+    # The documented failure shape is the envelope errors.py actually emits.
+    assert ref("/api/bookmarks", "get", "default").endswith("/ErrorOut")
+    # 204 means no body, so it must not advertise one.
+    delete = spec["paths"]["/api/bookmarks/{bookmark_id}"]["delete"]
+    assert "content" not in delete["responses"]["204"]
+
+
+def test_the_spec_documents_the_list_query_parameters(client):
+    params = {
+        p["name"]: p
+        for p in client.get("/openapi.json").json()["paths"]["/api/bookmarks"]["get"]["parameters"]
+    }
+    assert set(params) == {"tag", "q", "from", "to", "page", "per_page"}
+    # Documented under their wire names: `from` is a Python keyword, so the handler
+    # takes date_from and the alias is what appears here and in the URL.
+    assert all(p["in"] == "query" and not p.get("required") for p in params.values())
+    assert params["per_page"]["schema"]["maximum"] == 100

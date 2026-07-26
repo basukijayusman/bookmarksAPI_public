@@ -123,33 +123,53 @@ bash scripts\test.sh          # or: .venv\Scripts\python.exe -m pytest
 
 ---
 
-## Stage 6: Search, filter, pagination, stats
+## Stage 6: Search, filter, pagination, stats [✔]
 
 **Goal:** query the list endpoint; one raw-SQL aggregate endpoint.
 
-- [ ] Query params on `GET /api/bookmarks`: `tag`, `q`, `from`, `to`, `page`, `per_page`
-- [ ] `GET /api/bookmarks/stats` using raw SQL (declared **before** `/{bookmark_id}` so "stats" is not parsed as an id)
-- [ ] extend `tests/test_api.py`: search, filter, date range, pagination totals, stats
+- [x] Query params on `GET /api/bookmarks`: `tag`, `q`, `from`, `to`, `page`, `per_page`
+- [x] `GET /api/bookmarks/stats` using raw SQL (declared **before** `/{bookmark_id}` so "stats" is not parsed as an id)
+- [x] extend `tests/test_api.py`: search, filter, date range, pagination totals, stats
 
 **Key decisions:**
 - `total` uses a separate count query so pagination reports the full size, not the page size.
 - `total_tags` counts distinct tags on the caller's bookmarks, never `COUNT(*) FROM tags`.
 - `per_page` is capped (`le=100`) so a client cannot request an unbounded page.
+- `from`/`to` are Python keywords, so the handler takes `date_from`/`date_to` with `Query(alias=...)`;
+  the alias is what appears in the URL and in the spec.
+- `to` compares `< to + 1 day` rather than `<= to`: `created_at` carries a time, so `<=` would
+  keep only the rows created at exactly midnight. Both bounds are UTC days.
+- `q` is escaped before it goes into the LIKE pattern. Not injection (the term is bound) — an
+  unescaped `%` is a wildcard, so a search for `100%` would also match `1000`.
+- `ilike`, not `like`: SQLite's `LIKE` ignores ASCII case, Postgres' does not.
+- The `tag` query is lower/stripped the same way `BookmarkIn` normalises on write, or `Python`
+  would never match the `python` row it just created.
+- Stats rows are unpacked positionally: a SQLAlchemy `Row` is tuple-backed, so `row.count` resolves
+  to `tuple.count`, the method, not the column.
+- `strftime('%Y-%m', ...)` is SQLite's; Postgres would want `to_char(created_at, 'YYYY-MM')`.
 
 **Verify:** `bash scripts/test.sh api`; filter by tag/keyword/date narrows results, `stats` totals match only the caller's data.
 
 ---
 
-## Stage 7: OpenAPI documentation
+## Stage 7: OpenAPI documentation [✔]
 
 **Goal:** complete, accurate interactive docs.
 
-- [ ] Confirm `/docs` and `/openapi.json` render (free with FastAPI, generated from the schemas)
-- [ ] Response models and auth requirements show correctly per endpoint
+- [x] Confirm `/docs` and `/openapi.json` render (free with FastAPI, generated from the schemas)
+- [x] Response models and auth requirements show correctly per endpoint
 
 **Key decisions:**
 - The spec is generated from Pydantic models, so it cannot drift from the code.
 - `HTTPBearer` security scheme documents the token requirement.
+- No code was needed here, so the stage is four assertions instead: the spec is only
+  trustworthy if something fails when it stops matching. They check the security scheme, the
+  per-endpoint `security` block (present on bookmarks, absent on `/health` and the credential
+  endpoints), each response `$ref`, that 204 advertises no body, and the six query params by
+  their aliased names.
+- `Depends(HTTPBearer(...))` is enough for the scheme to appear; `Security()` is not required,
+  and `auto_error=False` does not hide it (the handler raises `ApiError` instead, to keep the
+  envelope consistent).
 
 **Verify:** `bash scripts/test.sh api` (contract checks pass); open `/docs`, click Authorize, exercise a protected endpoint.
 
