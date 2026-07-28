@@ -403,3 +403,45 @@ def test_the_spec_documents_the_list_query_parameters(client):
     # takes date_from and the alias is what appears here and in the URL.
     assert all(p["in"] == "query" and not p.get("required") for p in params.values())
     assert params["per_page"]["schema"]["maximum"] == 100
+
+
+# --- OpenAPI contract conformance -------------------------------------------
+#
+# The tests above assert the *spec* is shaped right; these assert the live responses
+# actually match it. Together they close the loop: the spec cannot drift from the code
+# (it is generated from the models), and the code cannot drift from the spec (these
+# validate against the served /openapi.json). `conforms` lives in conftest.py.
+
+
+def test_the_register_response_conforms_to_its_schema(client, conforms):
+    response = client.post(
+        "/api/auth/register",
+        json={"username": "alice", "email": "alice@example.com", "password": "hunter2-long"},
+    )
+    conforms(response, "/api/auth/register", "post", 201)  # AuthOut, with a nested UserOut
+
+
+def test_the_bookmark_crud_responses_conform_to_their_schemas(client, conforms):
+    headers = register(client)
+    created = client.post("/api/bookmarks", json=SAMPLE, headers=headers)
+    conforms(created, "/api/bookmarks", "post", 201)  # BookmarkOut
+
+    bookmark_id = created.json()["id"]
+    conforms(client.get(f"/api/bookmarks/{bookmark_id}", headers=headers),
+             "/api/bookmarks/{bookmark_id}", "get", 200)
+    conforms(client.get("/api/bookmarks", headers=headers),
+             "/api/bookmarks", "get", 200)  # BookmarkPage, items are BookmarkOut
+    # 204 promises no body; the fixture asserts the response honours that.
+    conforms(client.delete(f"/api/bookmarks/{bookmark_id}", headers=headers),
+             "/api/bookmarks/{bookmark_id}", "delete", 204)
+
+
+def test_the_stats_response_conforms_to_its_schema(client, conforms):
+    conforms(client.get("/api/bookmarks/stats", headers=register(client)),
+             "/api/bookmarks/stats", "get", 200)  # Stats, with nested TagCount/MonthCount
+
+
+def test_the_error_envelope_conforms_to_the_documented_shape(client, conforms):
+    # Any failure resolves to the `default` response, whose schema is ErrorOut. The
+    # body here is a 401, validated against the shape every endpoint documents for errors.
+    conforms(client.get("/api/bookmarks"), "/api/bookmarks", "get", "default")

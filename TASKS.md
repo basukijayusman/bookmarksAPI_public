@@ -175,14 +175,14 @@ bash scripts\test.sh          # or: .venv\Scripts\python.exe -m pytest
 
 ---
 
-## Stage 8: OpenAPI contract conformance
+## Stage 8: OpenAPI contract conformance [✔]
 
 **Goal:** assert that real API responses match the served OpenAPI spec. The API tests
 themselves are written in Stages 5 and 6 (parallel TDD); this stage adds only the contract
 layer, which needs the spec from Stage 7.
 
-- [ ] `tests/conftest.py`: add the `conforms` fixture that validates responses against the live `/openapi.json`
-- [ ] extend `tests/test_api.py`: assert each response shape against its OpenAPI component schema
+- [x] `tests/conftest.py`: add the `conforms` fixture that validates responses against the live `/openapi.json`
+- [x] extend `tests/test_api.py`: assert each response shape against its OpenAPI component schema
 
 **Key decisions:**
 - Contract tests read the served spec, so implementation and documentation are checked against each other.
@@ -192,12 +192,12 @@ layer, which needs the spec from Stage 7.
 
 ---
 
-## Stage 9: Deploy + rate limiting (bonus)
+## Stage 9: Deploy + rate limiting (bonus) [✔]
 
 **Goal:** a production start path and basic abuse protection.
 
-- [ ] `deploy.sh`: preflight (refuse missing key, refuse SQLite with >1 worker), migrate, `exec` uvicorn with workers and `--proxy-headers`
-- [ ] Rate limiting on the credential endpoints (in-process, keyed on the peer socket)
+- [x] `deploy.sh`: preflight (refuse missing key, refuse SQLite with >1 worker), migrate, `exec` uvicorn with workers and `--proxy-headers`
+- [x] Rate limiting on the credential endpoints (in-process, keyed on the peer socket) — built in Stage 4 (`app/auth.py:rate_limit`), wired onto `/register` and `/login` in Stage 5
 
 **Verify:** `deploy.sh` refuses to start on a missing `SECRET_KEY`; serves on a single worker.
 
